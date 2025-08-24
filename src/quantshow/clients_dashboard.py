@@ -118,15 +118,16 @@ def load_client(path: Path) -> pd.DataFrame:
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
+    up = delta.where(delta > 0, 0.0)
+    down = (-delta.where(delta < 0, 0.0))
 
-    roll_up = pd.Series(up, index=series.index).rolling(window).mean()
-    roll_down = pd.Series(down, index=series.index).rolling(window).mean()
+    roll_up = cast(pd.Series, up.rolling(window).mean())
+    roll_down = cast(pd.Series, down.rolling(window).mean())
 
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+    denom = cast(pd.Series, roll_down.mask(roll_down == 0, np.nan))
+    rs = cast(pd.Series, roll_up / denom)
+    rsi_series = cast(pd.Series, 100.0 - (100.0 / (1.0 + rs)))
+    return rsi_series
 
 
 def compute_portfolio_views(client_daily: pd.DataFrame, btc_daily: pd.DataFrame) -> pd.DataFrame:
@@ -169,23 +170,23 @@ def compute_portfolio_views(client_daily: pd.DataFrame, btc_daily: pd.DataFrame)
 
 
 def perf_summary(df: pd.DataFrame) -> Dict[str, float]:
-    first_btc = df["portfolio_btc"].iloc[0]
-    last_btc = df["portfolio_btc"].iloc[-1]
-    first_usd = df["portfolio_usd"].iloc[0]
-    last_usd = df["portfolio_usd"].iloc[-1]
+    first_btc = float(df["portfolio_btc"].iloc[0])
+    last_btc = float(df["portfolio_btc"].iloc[-1])
+    first_usd = float(df["portfolio_usd"].iloc[0])
+    last_usd = float(df["portfolio_usd"].iloc[-1])
 
-    total_ret_btc = (last_btc / first_btc) - 1.0 if first_btc and first_btc != 0 else np.nan
-    total_ret_usd = (last_usd / first_usd) - 1.0 if first_usd and first_usd != 0 else np.nan
-    max_dd = df["drawdown"].min()
-    sharpe30 = df["sharpe30"].iloc[-1]
+    total_ret_btc = float((last_btc / first_btc) - 1.0) if first_btc != 0.0 else float("nan")
+    total_ret_usd = float((last_usd / first_usd) - 1.0) if first_usd != 0.0 else float("nan")
+    max_dd = float(df["drawdown"].min())
+    sharpe30 = float(df["sharpe30"].iloc[-1])
 
     return {
-        "btc_position": last_btc,
-        "equity_usd": last_usd,
-        "total_ret_btc": total_ret_btc,
-        "total_ret_usd": total_ret_usd,
-        "max_drawdown": max_dd,
-        "sharpe30": sharpe30,
+        "btc_position": float(last_btc),
+        "equity_usd": float(last_usd),
+        "total_ret_btc": float(total_ret_btc),
+        "total_ret_usd": float(total_ret_usd),
+        "max_drawdown": float(max_dd),
+        "sharpe30": float(sharpe30),
     }
 
 
@@ -504,14 +505,6 @@ else:
 
 dr: Tuple[pd.Timestamp, pd.Timestamp] = (start_date, end_date)
 
-# BTC Market panel at the top for context
-st.subheader("Market Context")
-st.plotly_chart(
-    make_btc_market_panel(btc_daily, dr),
-    use_container_width=True,
-    key="btc_market_panel",
-)
-
 
 # ---------------------------
 # Cross-client analytics helpers
@@ -622,13 +615,88 @@ def make_drawdown_heatmap(client_dfs: Dict[str, pd.DataFrame]) -> go.Figure:
 
 
 # ---------------------------
+# Additional per-client analytics helpers
+# ---------------------------
+def make_multiwindow_corr(df: pd.DataFrame, windows: list[int] | None = None, title: str | None = None) -> go.Figure:
+    if windows is None:
+        windows = [30, 90]
+    r_p = cast(pd.Series, df["usd_ret"])  # portfolio daily ret
+    r_b = cast(pd.Series, df["ret"])      # BTC daily ret
+    fig = go.Figure()
+    for w in windows:
+        c = r_p.rolling(w).corr(r_b)
+        fig.add_trace(go.Scatter(x=c.index, y=c, mode="lines", name=f"Corr {w}d"))
+    fig.update_layout(
+        title=title or "Rolling Correlation vs BTC",
+        xaxis_title="Date",
+        yaxis_title="Correlation",
+        template="plotly_white",
+        height=360,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig
+
+
+def make_rolling_risk_panel(df: pd.DataFrame, window: int = 30) -> go.Figure:
+    r = cast(pd.Series, df["usd_ret"]).dropna()
+    if r.empty:
+        return go.Figure()
+    roll_mean = r.rolling(window).mean()
+    roll_std = r.rolling(window).std()
+    vol_ann = cast(pd.Series, roll_std * math.sqrt(ANNUALIZATION) * 100.0)
+    sharpe = cast(pd.Series, (roll_mean / roll_std) * math.sqrt(ANNUALIZATION))
+    var95 = cast(pd.Series, -r.rolling(window).quantile(0.05) * 100.0)
+    def _cvar_rolling(x: pd.Series) -> float:
+        if x.empty:
+            return float("nan")
+        q = x.quantile(0.05)
+        tail = x[x <= q]
+        return float(-tail.mean() * 100.0) if len(tail) else float("nan")
+    cvar95 = cast(pd.Series, r.rolling(window).apply(_cvar_rolling, raw=False))
+
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        subplot_titles=(f"Volatility {window}d (ann. %)", f"Sharpe {window}d (ann.)", f"VaR/CVaR {window}d (daily %)"))
+    fig.add_trace(go.Scatter(x=vol_ann.index, y=vol_ann, name="Vol (ann %)", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sharpe.index, y=sharpe, name="Sharpe (ann)", mode="lines"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=var95.index, y=var95, name="VaR95 (daily %)", mode="lines"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=cvar95.index, y=cvar95, name="ES95 (daily %)", mode="lines"), row=3, col=1)
+    fig.update_layout(height=720, template="plotly_white", margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def make_monthly_returns_bars(ret: pd.Series, title: str) -> go.Figure:
+    r = ret.dropna()
+    monthly = (1.0 + r).resample("M").apply(lambda s: (1.0 + s).prod() - 1.0) * 100.0
+    fig = go.Figure(go.Bar(x=monthly.index, y=monthly.values, marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in monthly.values]))
+    fig.update_layout(title=title, xaxis_title="Month", yaxis_title="Return (%)", template="plotly_white", height=360, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def make_annual_returns_bars(ret: pd.Series, title: str) -> go.Figure:
+    r = ret.dropna()
+    annual = (1.0 + r).resample("Y").apply(lambda s: (1.0 + s).prod() - 1.0) * 100.0
+    years = [int(ts.year) for ts in annual.index]
+    fig = go.Figure(go.Bar(x=years, y=annual.values, marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in annual.values]))
+    fig.update_layout(title=title, xaxis_title="Year", yaxis_title="Return (%)", template="plotly_white", height=360, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def make_autocorr_bars(ret: pd.Series, lags: int = 30, title: str | None = None) -> go.Figure:
+    r = ret.dropna()
+    vals = [r.autocorr(lag=i) for i in range(1, lags + 1)]
+    fig = go.Figure(go.Bar(x=list(range(1, lags + 1)), y=vals))
+    fig.update_layout(title=title or f"Autocorrelation (lags 1..{lags})", xaxis_title="Lag", yaxis_title="ACF", template="plotly_white", height=360, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+# ---------------------------
 # Overview + Client tabs
 # ---------------------------
 btc_slice_full = btc_daily.loc[(btc_daily.index >= start_date) & (btc_daily.index <= end_date)]
 
 # Pre-compute client data in selected range
 clients_data: Dict[str, pd.DataFrame] = {}
-ret_map: Dict[str, pd.Series] = {}
 for client_name, file_path in CLIENT_FILES.items():
     client_daily = load_client(file_path)
     client_slice = client_daily.loc[(client_daily.index >= start_date) & (client_daily.index <= end_date)]
@@ -638,46 +706,17 @@ for client_name, file_path in CLIENT_FILES.items():
     if dfv.empty:
         continue
     clients_data[client_name] = dfv
-    ret_map[client_name] = cast(pd.Series, dfv["usd_ret"])
 
-tabs = st.tabs(["Overview"] + list(CLIENT_FILES.keys()))
+tabs = st.tabs(["Market Context"] + list(CLIENT_FILES.keys()))
 
-# Overview tab
+# Market Context tab
 with tabs[0]:
-    st.subheader("Cross-Client Analytics")
-    if clients_data:
-        # Correlation heatmap incl. BTC
-        ret_df = pd.DataFrame({name: s for name, s in ret_map.items()})
-        ret_df["BTC"] = btc_slice_full["ret"]
-        st.plotly_chart(
-            make_correlation_heatmap(ret_df, "Daily Returns Correlation"),
-            use_container_width=True,
-            key="overview_corr_heatmap",
-        )
-
-        # Risk vs return scatter
-        st.plotly_chart(
-            make_risk_return_scatter(ret_map, "Risk vs Return (Annualized)"),
-            use_container_width=True,
-            key="overview_risk_return_scatter",
-        )
-
-        # Underwater heatmap across clients
-        st.plotly_chart(
-            make_drawdown_heatmap(clients_data),
-            use_container_width=True,
-            key="overview_underwater_heatmap",
-        )
-
-        # Monthly returns heatmap for selected client
-        sel = st.selectbox("Monthly returns heatmap – select client", options=list(clients_data.keys()))
-        st.plotly_chart(
-            make_monthly_returns_heatmap(cast(pd.Series, clients_data[sel]["usd_ret"]), f"{sel} – Monthly Returns"),
-            use_container_width=True,
-            key=f"overview_monthly_heatmap_{sel}",
-        )
-    else:
-        st.info("No client data available in selected date range.")
+    st.subheader("Market Context")
+    st.plotly_chart(
+        make_btc_market_panel(btc_daily, dr),
+        use_container_width=True,
+        key="tab_market_panel",
+    )
 
 # Individual client tabs
 for idx, (client_name, _file_path) in enumerate(CLIENT_FILES.items(), start=1):
@@ -718,17 +757,65 @@ for idx, (client_name, _file_path) in enumerate(CLIENT_FILES.items(), start=1):
             use_container_width=True,
             key=f"{client_name}_corr_beta_vol",
         )
-        with st.expander("Daily Returns Distribution"):
+        with st.expander("Daily Returns Distribution", expanded=True):
             st.plotly_chart(
                 make_returns_hist(df),
                 use_container_width=True,
                 key=f"{client_name}_returns_hist",
             )
-        with st.expander("Monthly Returns Heatmap"):
+        with st.expander("Monthly Returns Heatmap", expanded=True):
             st.plotly_chart(
                 make_monthly_returns_heatmap(cast(pd.Series, df["usd_ret"]), f"{client_name} – Monthly Returns"),
                 use_container_width=True,
                 key=f"{client_name}_monthly_returns_heatmap",
             )
+
+        # Additional multi-dimensional analytics (open by default)
+        st.plotly_chart(
+            make_multiwindow_corr(df, windows=[30, 90, 180], title="Rolling Correlation vs BTC (30/90/180d)"),
+            use_container_width=True,
+            key=f"{client_name}_corr_multiwindow",
+        )
+        st.plotly_chart(
+            make_rolling_risk_panel(df, window=30),
+            use_container_width=True,
+            key=f"{client_name}_rolling_risk_panel",
+        )
+        st.plotly_chart(
+            make_monthly_returns_bars(cast(pd.Series, df["usd_ret"]), f"{client_name} – Monthly Returns (%)"),
+            use_container_width=True,
+            key=f"{client_name}_monthly_bars",
+        )
+        st.plotly_chart(
+            make_annual_returns_bars(cast(pd.Series, df["usd_ret"]), f"{client_name} – Annual Returns (%)"),
+            use_container_width=True,
+            key=f"{client_name}_annual_bars",
+        )
+        st.plotly_chart(
+            make_autocorr_bars(cast(pd.Series, df["usd_ret"]), lags=30, title="Return Autocorrelation (lags 1..30)"),
+            use_container_width=True,
+            key=f"{client_name}_acf_bars",
+        )
+
+        # Risk summary table
+        r_all = cast(pd.Series, df["usd_ret"]).dropna()
+        if not r_all.empty:
+            ann_ret = (1.0 + r_all).prod() ** (ANNUALIZATION / max(len(r_all), 1)) - 1.0
+            ann_vol = r_all.std() * math.sqrt(ANNUALIZATION)
+            sharpe_ann = (r_all.mean() / r_all.std()) * math.sqrt(ANNUALIZATION) if r_all.std() != 0 else float("nan")
+            var95_all = -r_all.quantile(0.05)
+            es95_all = -r_all[r_all <= r_all.quantile(0.05)].mean()
+            max_dd = float(df["drawdown"].min())
+            risk_df = pd.DataFrame([
+                {
+                    "Ann. Return %": round(float(ann_ret) * 100.0, 2),
+                    "Ann. Vol %": round(float(ann_vol) * 100.0, 2),
+                    "Sharpe (ann)": round(float(sharpe_ann), 2) if not math.isnan(float(sharpe_ann)) else None,
+                    "VaR95 (daily %)": round(float(var95_all) * 100.0, 2),
+                    "ES95 (daily %)": round(float(es95_all) * 100.0, 2),
+                    "Max Drawdown %": round(max_dd * 100.0, 2),
+                }
+            ])
+            st.dataframe(risk_df, use_container_width=True)
 
 st.caption("Data sources: Client portfolio CSVs and Binance BTC/USDT daily OHLCV. All times UTC.")
