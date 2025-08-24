@@ -21,9 +21,9 @@ DATA_DIR = ROOT_DIR / "data"
 
 BTC_DAILY_FILE = DATA_DIR / "binance_BTC-USDT_1d_last3.0y.csv"
 CLIENT_FILES = {
-    "Client A (6.5 BTC start)": DATA_DIR / "6.5.csv",
+    "Client A (100 BTC start)": DATA_DIR / "100.csv",
     "Client B (10 BTC start)": DATA_DIR / "10.csv",
-    "Client C (100 BTC start)": DATA_DIR / "100.csv",
+    "Client C (6.5 BTC start)": DATA_DIR / "6.5.csv",
 }
 
 ANNUALIZATION = 365  # crypto trades daily
